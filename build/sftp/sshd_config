@@ -1,0 +1,27 @@
+Port 22
+Protocol 2
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+SyslogFacility AUTH
+LogLevel VERBOSE
+
+PermitRootLogin no
+PasswordAuthentication yes
+PubkeyAuthentication yes
+ChallengeResponseAuthentication no
+UsePAM yes
+
+MaxAuthTries 3
+MaxSessions 4
+LoginGraceTime 20
+
+Subsystem sftp internal-sftp
+
+Match User webmaster
+    ChrootDirectory /home/webmaster
+    ForceCommand internal-sftp
+    X11Forwarding no
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    PermitTunnel no

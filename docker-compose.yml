@@ -1,0 +1,168 @@
+version: "3.9"
+
+networks:
+  corsario:
+    name: corsario_net
+
+volumes:
+  web_html:
+  mariadb_data:
+  fail2ban_data:
+  traefik_certs:
+  sftp_hostkeys:
+
+services:
+  traefik:
+    image: traefik:v3.6.25
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=corsario_net
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+      - --certificatesresolvers.letsencrypt.acme.email=alonso@smartsystems.work
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --log.level=INFO
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_certs:/letsencrypt
+    networks:
+      - corsario
+    restart: unless-stopped
+    labels:
+      - traefik.enable=false
+
+  web:
+    image: corsario-web:latest
+    build:
+      context: ./build/web
+      dockerfile: Dockerfile
+    volumes:
+      - web_html:/var/www/html
+    networks:
+      - corsario
+    restart: unless-stopped
+    depends_on:
+      - mariadb
+      - gotenberg
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.corsario-web.rule=Host(`corsario.smartsystems.work`)
+      - traefik.http.routers.corsario-web.entrypoints=websecure
+      - traefik.http.routers.corsario-web.tls=true
+      - traefik.http.routers.corsario-web.tls.certresolver=letsencrypt
+      - traefik.http.services.corsario-web.loadbalancer.server.port=80
+
+  # Los 3 secretos (MARIADB_ROOT_PASSWORD, WEBMASTER_DB_PASSWORD, SFTP_WEBMASTER_PASSWORD) NO
+  # viven aqui ni en ningun fichero de este repositorio -- este repo es PUBLICO. Se definen
+  # como "Environment variables" del propio stack en Portainer (persisten en el servidor,
+  # nunca en git). Sus valores estan en el baul: credentials.md -> "SERVIDOR NUEVO MicroOS".
+  # Un `git clone` de este repo NO es suficiente para levantar la pila: hace falta poner esas
+  # 3 variables en Portainer primero. Ver README.md.
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      MARIADB_ROOT_PASSWORD: "${MARIADB_ROOT_PASSWORD}"
+      MARIADB_DATABASE: corsario
+      WEBMASTER_DB_PASSWORD: "${WEBMASTER_DB_PASSWORD}"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ./mariadb-init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - corsario
+    restart: unless-stopped
+    labels:
+      - traefik.enable=false
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:latest
+    environment:
+      PMA_HOST: mariadb
+      PMA_ABSOLUTE_URI: "https://pma.corsario.smartsystems.work/"
+      UPLOAD_LIMIT: 256M
+    networks:
+      - corsario
+    restart: unless-stopped
+    depends_on:
+      - mariadb
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.corsario-pma.rule=Host(`pma.corsario.smartsystems.work`)
+      - traefik.http.routers.corsario-pma.entrypoints=websecure
+      - traefik.http.routers.corsario-pma.tls=true
+      - traefik.http.routers.corsario-pma.tls.certresolver=letsencrypt
+      - traefik.http.routers.corsario-pma.middlewares=corsario-pma-auth
+      # Hash apr1 de basic-auth (no reversible) -- no es una contrasena en claro, se deja
+      # publica a proposito. Generada con `openssl passwd -apr1`.
+      - traefik.http.middlewares.corsario-pma-auth.basicauth.users=webmaster:$$apr1$$MCa71Asy$$lbT3CrKZAjvneXNeW/AwL1
+      - traefik.http.services.corsario-pma.loadbalancer.server.port=80
+
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    networks:
+      - corsario
+    restart: unless-stopped
+    labels:
+      - traefik.enable=false
+
+  sftp:
+    image: corsario-sftp:latest
+    build:
+      context: ./build/sftp
+      dockerfile: Dockerfile
+    environment:
+      WEBMASTER_PASSWORD: "${SFTP_WEBMASTER_PASSWORD}"
+    ports:
+      - "22:22"
+    volumes:
+      - web_html:/home/webmaster/www
+      - sftp_hostkeys:/etc/ssh
+      - /opt/corsario/sftp-logs:/var/log
+    networks:
+      - corsario
+    restart: unless-stopped
+    labels:
+      - traefik.enable=false
+
+  fail2ban:
+    image: crazymax/fail2ban:latest
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      TZ: America/Mexico_City
+      F2B_LOG_LEVEL: INFO
+      F2B_DB_PURGE_AGE: 30d
+    volumes:
+      - fail2ban_data:/data
+      - /opt/corsario/sftp-logs:/var/log/corsario-sftp:ro
+      - ./fail2ban/jail-sftp.conf:/data/jail.d/sftp-corsario.local:ro
+      - ./fail2ban/docker-user.conf:/data/action.d/docker-user.conf:ro
+    restart: unless-stopped
+    depends_on:
+      - sftp
+
+  # Ofelia = el programador de tareas. Arranca SIN trabajos (Paco los define via
+  # etiquetas ofelia.job-*.<nombre>.* en cualquier servicio de este compose, desde
+  # Portainer, y redespliega). "restart: no" a proposito: Ofelia se cae con
+  # "unable to start a empty scheduler" mientras no haya ni un job etiquetado -
+  # con unless-stopped entra en crash-loop indefinido. Sin jobs se queda Exited,
+  # limpio; en cuanto haya un job y se redespliegue, arranca y se queda arriba.
+  ofelia:
+    image: mcuadros/ofelia:latest
+    command: daemon --docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - corsario
+    restart: "no"
+    labels:
+      - traefik.enable=false
